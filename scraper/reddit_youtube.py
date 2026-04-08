@@ -3,112 +3,174 @@ reddit_youtube.py
 -----------------
 Fan sentiment from Reddit and baseball creator content from YouTube.
 
-Reddit:  Uses PRAW (Python Reddit API Wrapper) — free dev account at reddit.com/prefs/apps
-YouTube: Uses YouTube Data API v3 — free tier at console.cloud.google.com (10k units/day)
+Reddit:  Scraped directly via Reddit's public JSON endpoints — no API key needed.
+         Reddit exposes <url>.json for any listing or search page. We set a
+         descriptive User-Agent to comply with Reddit's API rules.
 
-Both are optional — the RAG pipeline degrades gracefully without them.
+YouTube: Uses YouTube Data API v3 — free tier at console.cloud.google.com (10k units/day)
+         Falls back to mock data when YOUTUBE_API_KEY is not set.
 """
 
 import os
 import re
+import requests
 from typing import Optional
 from datetime import datetime, timedelta
 
 
 # ── Reddit ────────────────────────────────────────────────────────────────────
 
+# Subreddits to search across (no credentials needed)
 BASEBALL_SUBREDDITS = [
-    "baseball", "redsox", "brewers", "mlb",
-    # Add team-specific ones as needed
+    "baseball", "mlb",
+    # Team-specific subs are added dynamically based on matchup teams
 ]
 
-# Creators whose channels we trust for baseball analysis
-TRUSTED_CHANNELS = {
-    "UCylmMBFmjuKoEJPEDZJDgLQ": "Jomboy Media",
-    "UCdHTCaFfHbFLiGSA_KsMqpg": "Foolish Baseball",
-    "UCdRSRAFKyHVZh7XsB6ij7lg": "Pitching Ninja",   # Rob Friedman
-    "UCO3-hFmSCZQBtj7rCLJXWnA": "Just Baseball",
-    "UCzg1q5gQl5tkZYJI2u5QKaQ": "Baseball Doesn't Exist",
+# Per-team subreddit mapping (lowercase last word of team name → subreddit)
+TEAM_SUBREDDITS = {
+    "yankees":     "NYYankees",
+    "redsox":      "redsox",
+    "mets":        "NewYorkMets",
+    "dodgers":     "Dodgers",
+    "giants":      "SFGiants",
+    "cubs":        "chicagocubs",
+    "cardinals":   "Cardinals",
+    "brewers":     "Brewers",
+    "reds":        "reds",
+    "pirates":     "buccos",
+    "phillies":    "phillies",
+    "braves":      "Braves",
+    "marlins":     "letsgofish",
+    "nationals":   "Nationals",
+    "astros":      "Astros",
+    "rangers":     "TexasRangers",
+    "angels":      "angelsbaseball",
+    "athletics":   "OaklandAthletics",
+    "mariners":    "Mariners",
+    "padres":      "Padres",
+    "rockies":     "ColoradoRockies",
+    "diamondbacks":"azdiamondbacks",
+    "tigers":      "motorcitykitties",
+    "indians":     "WahoosTipi",
+    "guardians":   "ClevelandGuardians",
+    "whitesox":    "whitesox",
+    "twins":       "minnesotatwins",
+    "royals":      "KCRoyals",
+    "orioles":     "orioles",
+    "rays":        "TampaBayRays",
+    "bluejays":    "Torontobluejays",
+    "jays":        "Torontobluejays",
 }
+
+_REDDIT_HEADERS = {
+    "User-Agent": "BaseballIQ/1.0 (baseball fan dashboard; educational project)",
+    "Accept": "application/json",
+}
+
+_REDDIT_BASE = "https://www.reddit.com"
+
+
+def _reddit_get(url: str, params: dict) -> list[dict]:
+    """
+    Fetch a Reddit JSON listing and return the list of post data dicts.
+    Returns [] on any error so callers degrade gracefully.
+    """
+    try:
+        resp = requests.get(url, params=params, headers=_REDDIT_HEADERS, timeout=10)
+        resp.raise_for_status()
+        children = resp.json()["data"]["children"]
+        return [c["data"] for c in children]
+    except Exception:
+        return []
 
 
 def get_reddit_posts(query: str, limit: int = 10,
                      subreddits: Optional[list] = None) -> list[dict]:
     """
     Search Reddit for posts related to a matchup or player.
+    Uses Reddit's public JSON API — no credentials required.
 
     Args:
-        query: e.g. "Red Sox Brewers" or "Rafael Devers injury"
-        limit: max posts to return
-        subreddits: list of subreddit names (defaults to BASEBALL_SUBREDDITS)
-
-    Setup:
-        1. Go to reddit.com/prefs/apps
-        2. Create a "script" app
-        3. Add REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT to .env
+        query:      e.g. "Red Sox Brewers" or "Rafael Devers injury"
+        limit:      max posts to return
+        subreddits: override the default list of subreddits to search
     """
-    try:
-        import praw
-    except ImportError:
-        return [{"error": "praw not installed. Run: pip install praw"}]
+    subs = list(subreddits) if subreddits else list(BASEBALL_SUBREDDITS)
 
-    client_id = os.getenv("REDDIT_CLIENT_ID")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-    user_agent = os.getenv("REDDIT_USER_AGENT", "BaseballIQ/1.0")
+    # Auto-add team-specific subs based on words in the query
+    for word in query.lower().split():
+        if word in TEAM_SUBREDDITS and TEAM_SUBREDDITS[word] not in subs:
+            subs.append(TEAM_SUBREDDITS[word])
 
-    if not client_id or not client_secret:
-        return _mock_reddit_posts(query)
+    cutoff = datetime.utcnow() - timedelta(days=4)
+    seen_ids: set[str] = set()
+    posts: list[dict] = []
 
-    reddit = praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
+    # Search the combined multireddit (e.g. r/baseball+mlb+Brewers)
+    combined = "+".join(subs)
+    raw = _reddit_get(
+        f"{_REDDIT_BASE}/r/{combined}/search.json",
+        params={"q": query, "sort": "new", "restrict_sr": "1",
+                "limit": min(limit * 4, 100), "t": "week"},
     )
 
-    subs = subreddits or BASEBALL_SUBREDDITS
-    combined = "+".join(subs)
-    subreddit = reddit.subreddit(combined)
+    # Fall back to sitewide search if the multireddit search returned nothing
+    if not raw:
+        raw = _reddit_get(
+            f"{_REDDIT_BASE}/search.json",
+            params={"q": query, "sort": "new", "limit": min(limit * 4, 100), "t": "week"},
+        )
 
-    posts = []
-    cutoff = datetime.utcnow() - timedelta(days=3)  # last 3 days only
+    for item in raw:
+        post_id = item.get("id", "")
+        if post_id in seen_ids:
+            continue
+        seen_ids.add(post_id)
 
-    for submission in subreddit.search(query, sort="new", limit=limit * 3):
-        created = datetime.utcfromtimestamp(submission.created_utc)
+        created_utc = item.get("created_utc", 0)
+        created = datetime.utcfromtimestamp(created_utc)
         if created < cutoff:
             continue
 
-        # Skip low-engagement posts
-        if submission.score < 5 and submission.num_comments < 3:
+        # Skip spam / zero-engagement posts
+        if item.get("score", 0) < 1 and item.get("num_comments", 0) < 1:
             continue
 
+        body = item.get("selftext", "") or ""
+        # "[removed]" / "[deleted]" bodies are useless
+        if body.lower() in ("[removed]", "[deleted]"):
+            body = ""
+
         posts.append({
-            "id": submission.id,
-            "subreddit": f"r/{submission.subreddit.display_name}",
-            "title": submission.title,
-            "body": submission.selftext[:500] if submission.selftext else "",
-            "score": submission.score,
-            "comments": submission.num_comments,
-            "url": f"https://reddit.com{submission.permalink}",
-            "created": created.isoformat(),
-            "flair": submission.link_flair_text or "",
+            "id":       post_id,
+            "sub":      f"r/{item.get('subreddit', 'baseball')}",
+            "title":    item.get("title", ""),
+            "body":     body[:500],
+            "score":    item.get("score", 0),
+            "comments": item.get("num_comments", 0),
+            "url":      f"{_REDDIT_BASE}{item.get('permalink', '')}",
+            "created":  created.isoformat(),
+            "flair":    item.get("link_flair_text") or "",
         })
 
         if len(posts) >= limit:
             break
 
+    if not posts:
+        return _fallback_reddit_posts(query)
+
     return posts
 
 
-def _mock_reddit_posts(query: str) -> list[dict]:
-    """Mock data for when Reddit credentials aren't configured."""
+def _fallback_reddit_posts(query: str) -> list[dict]:
+    """Shown when scraping returns nothing (e.g. rate-limited or no matching posts)."""
     return [
         {
-            "subreddit": "r/baseball",
-            "title": f"[Game Thread] {query}",
-            "body": "Mock Reddit post. Add REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to .env for real data.",
-            "score": 42,
-            "comments": 18,
-            "source": "mock",
+            "sub":      "r/baseball",
+            "title":    f"[Game Thread] {query}",
+            "body":     "No recent Reddit posts found. Reddit may be rate-limiting — try again shortly.",
+            "score":    0,
+            "comments": 0,
         }
     ]
 
@@ -245,10 +307,11 @@ def get_video_transcript(video_id: str) -> str:
 # ── Quick Test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("📱 REDDIT POSTS (mock — add credentials to .env for real data)")
-    posts = get_reddit_posts("Red Sox Brewers")
+    print("📱 REDDIT POSTS (scraped — no credentials needed)")
+    posts = get_reddit_posts("Red Sox Brewers", limit=5)
     for p in posts:
-        print(f"  [{p['subreddit']}] {p['title']}")
+        print(f"  [{p['sub']}] {p['title']}")
+        print(f"    ▲ {p['score']}  💬 {p['comments']}  — {p['url']}")
 
     print("\n📺 YOUTUBE SUMMARIES (mock — add YOUTUBE_API_KEY for real data)")
     videos = get_youtube_summaries("Red Sox Brewers preview")

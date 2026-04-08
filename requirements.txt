@@ -13,3 +13,5 @@ pandas
 xgboost
 scikit-learn
 python-dotenv
+streamlit
+plotly

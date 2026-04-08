@@ -21,15 +21,24 @@ from pathlib import Path
 from typing import Optional
 from datetime import date
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import chromadb
 from chromadb.utils import embedding_functions
 
-# LLM — swap this import for OpenAI if preferred
+# LLM imports
 try:
     import anthropic
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -347,26 +356,70 @@ def query_custom(question: str, n_results: int = 8) -> str:
 
 # ── LLM Call ──────────────────────────────────────────────────────────────────
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+
+def _call_ollama(system: str, user: str) -> str:
+    """Call a local Ollama model via its REST API."""
+    # Truncate user prompt to stay within a small context window
+    max_chars = 3000
+    if len(user) > max_chars:
+        user = user[:max_chars] + "\n...[truncated]"
+
+    resp = requests.post(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        json={
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "options": {
+                "num_ctx": 2048,   # smaller KV cache = ~64 MiB vs 128 MiB
+                "num_predict": 512, # limit response length
+            },
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
 def _call_llm(system: str, user: str) -> str:
     """
-    Call the LLM. Uses Claude if available, otherwise returns a formatted mock.
-    Swap this function to use OpenAI, local Ollama, or any other provider.
+    Call the LLM with the following priority:
+      1. Ollama (local, free) — if reachable
+      2. Claude (Anthropic API) — if ANTHROPIC_API_KEY is set
+      3. Preview stub — prints prompts so you can inspect them
     """
+    # 1. Try Ollama
+    if REQUESTS_AVAILABLE:
+        try:
+            return _call_ollama(system, user)
+        except Exception as e:
+            print(f"   ⚠️  Ollama unavailable ({e}). Trying Anthropic...")
+
+    # 2. Try Anthropic
     api_key = os.getenv("ANTHROPIC_API_KEY")
-
     if ANTHROPIC_AVAILABLE and api_key:
-        client = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2000,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return message.content[0].text
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=2000,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return message.content[0].text
+        except Exception as e:
+            print(f"   ⚠️  Anthropic API error: {e}")
 
-    # Fallback: show what would be sent to the LLM
+    # 3. Fallback preview
     return (
-        "⚠️  No ANTHROPIC_API_KEY found. Set it in your .env file.\n\n"
+        "⚠️  No LLM available. Install Ollama (https://ollama.com) and run:\n"
+        "   ollama pull llama3\n\n"
         "SYSTEM PROMPT PREVIEW:\n" + system[:200] + "...\n\n"
         "USER PROMPT PREVIEW (first 500 chars):\n" + user[:500] + "..."
     )
