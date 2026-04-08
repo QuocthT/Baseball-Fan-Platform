@@ -1,0 +1,15 @@
+pybaseball
+requests
+beautifulsoup4
+playwright
+praw
+langchain
+langchain-community
+langchain-anthropic
+chromadb
+sentence-transformers
+streamlit
+pandas
+xgboost
+scikit-learn
+python-dotenv
