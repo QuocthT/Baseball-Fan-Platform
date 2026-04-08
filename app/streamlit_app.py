@@ -22,6 +22,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import date, datetime
+import numpy as np
 import time
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -421,6 +422,95 @@ def arsenal_chart(arsenal: list, pitcher_name: str) -> go.Figure:
     fig.update_yaxes(gridcolor="#2d3748", tickfont=dict(color="#a0aec0"))
     return fig
 
+def plot_pitch_movement(df_pitches: pd.DataFrame) -> go.Figure:
+    """Scatter plot of horizontal vs. vertical pitch break (pfx_x vs pfx_z)."""
+    fig = px.scatter(
+        df_pitches, x="pfx_x", y="pfx_z", color="pitch_type",
+        color_discrete_map={
+            "FF": "#f56565", "SI": "#4299e1", "SL": "#ed8936",
+            "CH": "#48bb78", "CU": "#9f7aea", "FC": "#f6e05e", "ST": "#fc8181"
+        },
+        labels={"pfx_x": "Horizontal Break (in)", "pfx_z": "Vertical Break (in)", "pitch_type": "Pitch"}
+    )
+    fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#4a5568")
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#4a5568")
+    fig.update_layout(
+        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+        font=dict(color="#a0aec0"),
+        height=350, margin=dict(l=20, r=20, t=30, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
+
+def plot_strike_zone(df_pitches: pd.DataFrame) -> go.Figure:
+    """Heatmap of pitch locations over the plate (plate_x vs plate_z)."""
+    fig = go.Figure()
+    
+    # 2D Density Contour
+    fig.add_trace(go.Histogram2dContour(
+        x=df_pitches["plate_x"], y=df_pitches["plate_z"],
+        colorscale="YlOrRd", reversescale=False, showscale=False,
+        ncontours=15, line=dict(width=0)
+    ))
+    
+    # Draw the Strike Zone
+    fig.add_shape(
+        type="rect", x0=-0.83, y0=1.5, x1=0.83, y1=3.5,
+        line=dict(color="white", width=2, dash="dash"),
+        fillcolor="rgba(0,0,0,0)"
+    )
+    
+    fig.update_layout(
+        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+        font=dict(color="#a0aec0"), height=350,
+        xaxis=dict(title="Plate X", range=[-2.5, 2.5], zeroline=False),
+        yaxis=dict(title="Plate Z", range=[0, 5], zeroline=False),
+        margin=dict(l=20, r=20, t=30, b=20)
+    )
+    return fig
+
+def plot_spray_chart(df_hits: pd.DataFrame) -> go.Figure:
+    """Basic batter spray chart using hit coordinates (hc_x, hc_y)."""
+    fig = px.scatter(
+        df_hits, x="hc_x", y="hc_y", color="events",
+        color_discrete_map={"Single": "#63b3ed", "Double": "#48bb78", "Triple": "#ed8936", "Home Run": "#f56565"},
+        labels={"hc_x": "", "hc_y": "", "events": "Result"}
+    )
+    # Mock baseball diamond overlay
+    fig.add_shape(type="path", path="M 125 204 L 125 100 L 25 100 Z", line_color="#4a5568", fillcolor="rgba(0,0,0,0)")
+    
+    fig.update_layout(
+        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+        font=dict(color="#a0aec0"), height=300,
+        xaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False, autorange="reversed"),
+        margin=dict(l=0, r=0, t=20, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5)
+    )
+    return fig
+
+# --- TEMPORARY MOCK DATA GENERATOR ---
+def get_mock_statcast_pitcher(pitcher_name):
+    """Generates fake pitch-by-pitch coordinate data until pybaseball is hooked up."""
+    n_pitches = 200
+    pitch_types = np.random.choice(["FF", "SL", "CH", "CU"], n_pitches, p=[0.5, 0.3, 0.15, 0.05])
+    return pd.DataFrame({
+        "pitch_type": pitch_types,
+        "pfx_x": np.where(pitch_types == "FF", np.random.normal(-5, 2, n_pitches), np.random.normal(6, 3, n_pitches)),
+        "pfx_z": np.where(pitch_types == "FF", np.random.normal(15, 2, n_pitches), np.random.normal(-2, 4, n_pitches)),
+        "plate_x": np.random.normal(0, 1.2, n_pitches),
+        "plate_z": np.random.normal(2.5, 1.0, n_pitches),
+    })
+
+def get_mock_spray_chart():
+    """Generates fake batted ball coordinates."""
+    n_hits = 50
+    events = np.random.choice(["Single", "Double", "Home Run"], n_hits, p=[0.6, 0.3, 0.1])
+    return pd.DataFrame({
+        "events": events,
+        "hc_x": np.random.normal(125, 40, n_hits),
+        "hc_y": np.where(events == "Home Run", np.random.normal(40, 10, n_hits), np.random.normal(130, 30, n_hits))
+    })
 
 def try_real_rag(game: dict, home_p: dict, away_p: dict,
                  home_lineup: list, away_lineup: list,
@@ -661,21 +751,25 @@ with tab2:
             st.markdown(f"**Form:** {pitcher['recent_form']}")
             st.markdown(f"*{pitcher['scouting']}*")
 
-            st.markdown('<p class="section-header">Arsenal Breakdown</p>', unsafe_allow_html=True)
+            st.markdown('<p class="section-header">Arsenal & Movement</p>', unsafe_allow_html=True)
+            
+            # Use real arsenal if available, otherwise fallback
             if pitcher["arsenal"]:
                 st.plotly_chart(
                     arsenal_chart(pitcher["arsenal"], pitcher["name"]),
                     use_container_width=True, key=f"arsenal_{side}"
                 )
-                st.markdown('<p class="section-header">Pitch Details</p>', unsafe_allow_html=True)
-                df_arsenal = pd.DataFrame(pitcher["arsenal"])[["pitch", "pct", "velo", "whiff"]]
-                df_arsenal.columns = ["Pitch", "Usage %", "Velo (mph)", "Whiff %"]
-                st.dataframe(df_arsenal, use_container_width=True, hide_index=True)
-            else:
-                st.info(
-                    "⚙️ Statcast pitch arsenal requires **pybaseball**. "
-                    "See `scraper/statcast.py` → `get_pitcher_arsenal()` to enable."
-                )
+            
+            # Advanced Statcast Visuals
+            df_statcast = get_mock_statcast_pitcher(pitcher["name"])
+            
+            plot_col1, plot_col2 = st.columns(2)
+            with plot_col1:
+                st.markdown("<div style='text-align:center; color:#a0aec0; font-size:12px;'>Pitch Movement (Break)</div>", unsafe_allow_html=True)
+                st.plotly_chart(plot_pitch_movement(df_statcast), use_container_width=True, key=f"move_{side}")
+            with plot_col2:
+                st.markdown("<div style='text-align:center; color:#a0aec0; font-size:12px;'>Pitch Location Heatmap</div>", unsafe_allow_html=True)
+                st.plotly_chart(plot_strike_zone(df_statcast), use_container_width=True, key=f"zone_{side}")
 
             st.markdown('<p class="section-header">Lineup Threats vs This Pitcher</p>',
                        unsafe_allow_html=True)
@@ -762,6 +856,11 @@ with tab3:
                         )
                 if i < len(lineup):
                     st.markdown('<hr style="margin:4px 0;border-color:#2d3748">', unsafe_allow_html=True)
+
+            # Batter Spray Chart (Team Level)
+            st.markdown('<p class="section-header">Team Spray Chart (Recent 14 Days)</p>', unsafe_allow_html=True)
+            df_spray = get_mock_spray_chart()
+            st.plotly_chart(plot_spray_chart(df_spray), use_container_width=True, key=f"spray_{team_name}")
 
             # OPS chart
             st.markdown('<p class="section-header">OPS by Batting Position</p>', unsafe_allow_html=True)
