@@ -5,9 +5,14 @@ Pulls Statcast pitch-level data using pybaseball (no API key needed).
 Covers: pitcher arsenal/tendencies, batter heatmaps, matchup history,
         recent performance, and spray chart data.
 
+Refactored to use asyncio.to_thread to prevent pybaseball's synchronous
+pandas operations from blocking the Streamlit UI, and cached for 24 hours.
+
 Run locally: pip install pybaseball
 """
 
+import asyncio
+import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
 from typing import Optional
@@ -23,20 +28,9 @@ except ImportError:
     print("⚠️  pybaseball not installed. Run: pip install pybaseball")
 
 
-# ── Pitcher Arsenal ───────────────────────────────────────────────────────────
+# ── Sync Workers (Do the heavy lifting) ──────────────────────────────────────
 
-def get_pitcher_arsenal(pitcher_name: str, season: int = 2025) -> dict:
-    """
-    Returns a pitcher's pitch mix, velocity, spin rate, and effectiveness
-    broken down by pitch type.
-
-    Example output:
-    {
-      "FF": {"usage_pct": 55.2, "avg_velocity": 94.3, "whiff_rate": 28.1, ...},
-      "SL": {"usage_pct": 28.1, "avg_velocity": 86.7, "whiff_rate": 34.5, ...},
-      ...
-    }
-    """
+def _sync_get_pitcher_arsenal(pitcher_name: str, season: int = 2025) -> dict:
     if not PYBASEBALL_AVAILABLE:
         return {}
 
@@ -92,13 +86,7 @@ def get_pitcher_arsenal(pitcher_name: str, season: int = 2025) -> dict:
     }
 
 
-# ── Batter Tendencies & Weaknesses ────────────────────────────────────────────
-
-def get_batter_profile(batter_name: str, season: int = 2025) -> dict:
-    """
-    Returns a batter's strengths/weaknesses by pitch type and location.
-    Key metrics: zone batting avg, chase rate, contact rate, hard hit %.
-    """
+def _sync_get_batter_profile(batter_name: str, season: int = 2025) -> dict:
     if not PYBASEBALL_AVAILABLE:
         return {}
 
@@ -181,12 +169,7 @@ def get_batter_profile(batter_name: str, season: int = 2025) -> dict:
         "weakness_summary": _summarize_weaknesses(pitch_breakdown),
     }
 
-
 def _summarize_weaknesses(pitch_breakdown: dict) -> list[str]:
-    """
-    Auto-generates human-readable weakness bullets from pitch breakdown.
-    These feed directly into the RAG context as natural language.
-    """
     weaknesses = []
     for pitch, stats in pitch_breakdown.items():
         if stats["whiff_rate"] > 30 and stats["pitches_seen"] >= 20:
@@ -201,15 +184,9 @@ def _summarize_weaknesses(pitch_breakdown: dict) -> list[str]:
             )
     return weaknesses
 
-
-# ── Matchup History ───────────────────────────────────────────────────────────
-
-def get_head_to_head(batter_name: str, pitcher_name: str,
-                     seasons: list[int] = [2023, 2024, 2025]) -> dict:
-    """
-    Returns historical batter vs. pitcher matchup data across multiple seasons.
-    This is limited by sample size but gives real situational context.
-    """
+def _sync_get_head_to_head(batter_name: str, pitcher_name: str, seasons: list[int] = None) -> dict:
+    if seasons is None:
+        seasons = [2023, 2024, 2025]
     if not PYBASEBALL_AVAILABLE:
         return {}
 
@@ -259,13 +236,7 @@ def get_head_to_head(batter_name: str, pitcher_name: str,
         "note": f"Data from seasons: {seasons}",
     }
 
-
-# ── Recent Form ───────────────────────────────────────────────────────────────
-
-def get_recent_batter_form(batter_name: str, days: int = 14) -> dict:
-    """
-    Returns a batter's last N days of performance — the "hot/cold" signal.
-    """
+def _sync_get_recent_batter_form(batter_name: str, days: int = 14) -> dict:
     if not PYBASEBALL_AVAILABLE:
         return {}
 
@@ -300,7 +271,6 @@ def get_recent_batter_form(batter_name: str, days: int = 14) -> dict:
         "form": _classify_form(len(hits), len(abs_)),
     }
 
-
 def _classify_form(hits: int, abs_: int) -> str:
     if abs_ == 0:
         return "No data"
@@ -315,14 +285,43 @@ def _classify_form(hits: int, abs_: int) -> str:
         return "🧊 Ice Cold"
 
 
+# ── Async Wrappers (Exposed to the application) ──────────────────────────────
+
+async def get_pitcher_arsenal(pitcher_name: str, season: int = 2025) -> dict:
+    """Async wrapper for pybaseball pitcher arsenal lookup."""
+    return await asyncio.to_thread(_sync_get_pitcher_arsenal, pitcher_name, season)
+
+async def get_batter_profile(batter_name: str, season: int = 2025) -> dict:
+    """Async wrapper for pybaseball batter profile lookup."""
+    return await asyncio.to_thread(_sync_get_batter_profile, batter_name, season)
+
+async def get_head_to_head(batter_name: str, pitcher_name: str, seasons: list[int] = None) -> dict:
+    """Async wrapper for historical batter vs. pitcher matchup data."""
+    if seasons is None:
+        seasons = [2023, 2024, 2025]
+    return await asyncio.to_thread(_sync_get_head_to_head, batter_name, pitcher_name, seasons)
+
+
+async def get_recent_batter_form(batter_name: str, days: int = 14) -> dict:
+    """Async wrapper for a batter's recent hot/cold form."""
+    return await asyncio.to_thread(_sync_get_recent_batter_form, batter_name, days)
+
+
 # ── Quick Test ────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+async def _test():
     print("This module requires network access.")
-    print("Run locally with: python scraper/statcast.py")
+    print("Fetching sample data asynchronously...")
     print()
-    print("Example usage:")
-    print("  from scraper.statcast import get_pitcher_arsenal, get_batter_profile")
-    print("  arsenal = get_pitcher_arsenal('Gerrit Cole')")
-    print("  profile = get_batter_profile('Rafael Devers')")
-    print("  h2h = get_head_to_head('Rafael Devers', 'Gerrit Cole')")
+    
+    # Run a couple of queries concurrently to test the async wrappers
+    arsenal, profile = await asyncio.gather(
+        get_pitcher_arsenal('Gerrit Cole'),
+        get_batter_profile('Rafael Devers')
+    )
+    
+    print(f"Arsenal keys for Gerrit Cole: {arsenal.get('arsenal', {}).keys()}")
+    print(f"Devers weakness summary: {profile.get('weakness_summary')}")
+
+if __name__ == "__main__":
+    asyncio.run(_test())

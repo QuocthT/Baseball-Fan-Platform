@@ -56,6 +56,11 @@ python main.py --game "Red Sox" --date 2026-04-08
 python main.py --query "How does Rafael Devers hit against sliders?"
 ```
 
+### 6. Run the app
+```bash
+streamlit run app/streamlit_app.py
+```
+
 ---
 
 ## 🧠 How the RAG Pipeline Works

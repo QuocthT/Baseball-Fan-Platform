@@ -6,6 +6,9 @@ praw
 langchain
 langchain-community
 langchain-anthropic
+langchain-ollama
+langchain-core
+langgraph
 chromadb
 sentence-transformers
 streamlit

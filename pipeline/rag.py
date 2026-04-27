@@ -4,22 +4,17 @@ rag.py
 The core RAG (Retrieval-Augmented Generation) pipeline for Baseball IQ.
 
 Flow:
-  1. Ingest: convert raw scraped data → natural language "documents"
-  2. Embed:  chunk + store in ChromaDB (local vector DB, no server needed)
-  3. Query:  retrieve relevant chunks → send to LLM → get pre-game brief
-
-LLM: Claude (via Anthropic API) or any OpenAI-compatible model.
-Vector DB: ChromaDB (local, free, no setup).
-
-This is your class project core — RAG done properly.
+  1. Load stats: structured data goes into an in-memory dictionary (no embedding).
+  2. Ingest: unstructured text (sentiment, umpire, injuries) → ChromaDB.
+  3. Query: LLM uses Tool Calling to route stat questions to memory and narrative questions to ChromaDB.
 """
 
 import os
-import json
 import hashlib
 from pathlib import Path
 from typing import Optional
 from datetime import date
+import pandas as pd
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,43 +22,51 @@ load_dotenv()
 import chromadb
 from chromadb.utils import embedding_functions
 
-# LLM imports
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
-
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
-
+# LangChain Imports for Hybrid Routing
+from langchain_core.tools import tool
+# from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import SystemMessage
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).parent.parent / "data" / "chroma_db"
 COLLECTION_NAME = "baseball_iq"
-
-# Uses a local sentence-transformer model for embeddings (free, no API key)
-# Model downloads automatically on first run (~90MB)
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
+# ── In-Memory Structured Store ────────────────────────────────────────────────
+
+# This holds exact stats so the LLM doesn't have to guess from vector similarities.
+CURRENT_GAME_STATS = {}
+
+def load_structured_stats(game_data: dict):
+    """Load exact math/stats into memory for the LangChain Tool to access."""
+    CURRENT_GAME_STATS.clear()
+    
+    # Store pitcher stats
+    CURRENT_GAME_STATS["home_pitcher"] = game_data.get("home_pitcher_stats", {})
+    CURRENT_GAME_STATS["away_pitcher"] = game_data.get("away_pitcher_stats", {})
+    
+    # Store pitch arsenals
+    CURRENT_GAME_STATS["home_pitcher_arsenal"] = game_data.get("home_pitcher_arsenal", {})
+    CURRENT_GAME_STATS["away_pitcher_arsenal"] = game_data.get("away_pitcher_arsenal", {})
+    
+    # Store lineups as markdown tables for the LLM to easily read
+    home_lineup = game_data.get("home_lineup", {}).get("batting_order", [])
+    away_lineup = game_data.get("away_lineup", {}).get("batting_order", [])
+    
+    if home_lineup:
+        CURRENT_GAME_STATS["home_lineup"] = pd.DataFrame(home_lineup).to_markdown()
+    if away_lineup:
+        CURRENT_GAME_STATS["away_lineup"] = pd.DataFrame(away_lineup).to_markdown()
 
 # ── Vector Store Setup ────────────────────────────────────────────────────────
 
 def get_collection() -> chromadb.Collection:
-    """
-    Initialize (or load) the ChromaDB collection.
-    ChromaDB stores everything locally in /data/chroma_db — no server needed.
-    """
     DB_PATH.mkdir(parents=True, exist_ok=True)
-
     client = chromadb.PersistentClient(path=str(DB_PATH))
 
-    # Use chromadb's built-in default embeddings (no extra install needed)
-    # Swap for SentenceTransformerEmbeddingFunction locally for better quality
     try:
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
         ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
@@ -75,34 +78,19 @@ def get_collection() -> chromadb.Collection:
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
-
     return collection
 
 
-# ── Document Ingestion ────────────────────────────────────────────────────────
+# ── Document Ingestion (Qualitative ONLY) ─────────────────────────────────────
 
 def ingest_game_data(game_data: dict) -> int:
     """
-    Convert a full game data bundle into documents and store in ChromaDB.
-
-    game_data structure:
-    {
-      "game": {...},              # from mlb_api.get_games()
-      "home_lineup": {...},       # from mlb_api.get_lineup()
-      "away_lineup": {...},
-      "home_pitcher_stats": {...},# from mlb_api.get_pitcher_stats()
-      "away_pitcher_stats": {...},
-      "home_pitcher_arsenal": {},  # from statcast.get_pitcher_arsenal()
-      "away_pitcher_arsenal": {},
-      "batter_profiles": [...],   # from statcast.get_batter_profile()
-      "injuries": [...],          # from mlb_api.get_injuries()
-      "umpire": {...},            # from umpire.get_umpire_info()
-      "reddit_posts": [...],      # from reddit_youtube.py
-      "youtube_summaries": [...],
-    }
-
-    Returns: number of documents ingested
+    Convert ONLY qualitative/text data into documents and store in ChromaDB.
+    (Stats are handled by load_structured_stats).
     """
+    # First, load the stats into memory
+    load_structured_stats(game_data)
+    
     collection = get_collection()
     docs = []
     metadatas = []
@@ -114,7 +102,6 @@ def ingest_game_data(game_data: dict) -> int:
     game_date = game.get("date", date.today().isoformat())
 
     def add_doc(text: str, doc_type: str, **extra_meta):
-        """Helper to add a document with consistent metadata."""
         doc_id = hashlib.md5(f"{game_id}:{doc_type}:{text[:50]}".encode()).hexdigest()
         docs.append(text)
         metadatas.append({
@@ -127,213 +114,124 @@ def ingest_game_data(game_data: dict) -> int:
         ids.append(doc_id)
 
     # 1. Game overview
-    add_doc(
-        f"Game: {matchup} on {game_date}. "
-        f"Venue: {game.get('venue', 'Unknown')}. "
-        f"Home probable pitcher: {game.get('home_probable_pitcher', {}).get('name', 'TBD')}. "
-        f"Away probable pitcher: {game.get('away_probable_pitcher', {}).get('name', 'TBD')}.",
-        doc_type="game_overview"
-    )
+    add_doc(f"Game: {matchup} on {game_date}. Venue: {game.get('venue', 'Unknown')}.", doc_type="game_overview")
 
-    # 2. Pitcher stats
-    for side in ["home", "away"]:
-        ps = game_data.get(f"{side}_pitcher_stats", {})
-        if ps and "era" in ps:
-            add_doc(
-                f"{side.capitalize()} starting pitcher {ps.get('name', 'Unknown')}: "
-                f"ERA {ps.get('era')}, WHIP {ps.get('whip')}, "
-                f"{ps.get('strikeouts')} strikeouts in {ps.get('innings_pitched')} IP, "
-                f"W-L record {ps.get('wins')}-{ps.get('losses')}, "
-                f"K/9 {ps.get('strikeout_per_9')}.",
-                doc_type=f"{side}_pitcher_stats",
-                pitcher=ps.get("name", "")
-            )
-
-    # 3. Pitcher arsenal
-    for side in ["home", "away"]:
-        arsenal_data = game_data.get(f"{side}_pitcher_arsenal", {})
-        arsenal = arsenal_data.get("arsenal", {})
-        if arsenal:
-            pitch_lines = []
-            for pitch_type, stats in arsenal.items():
-                pitch_lines.append(
-                    f"{pitch_type} ({stats['usage_pct']}% usage, "
-                    f"{stats['avg_velocity']} mph, {stats['whiff_rate']}% whiff rate)"
-                )
-            add_doc(
-                f"{side.capitalize()} pitcher {arsenal_data.get('pitcher', '')} arsenal: "
-                + ", ".join(pitch_lines) + ".",
-                doc_type=f"{side}_pitcher_arsenal",
-                pitcher=arsenal_data.get("pitcher", "")
-            )
-
-    # 4. Lineups
-    for side in ["home", "away"]:
-        lineup_data = game_data.get(f"{side}_lineup", {})
-        batters = lineup_data.get("batting_order", [])
-        if batters:
-            batter_lines = [
-                f"{b['name']} ({b['position']}, .{str(b.get('batting_avg','.???')).replace('.','')[:3]} AVG, "
-                f"{b.get('home_runs', 0)} HR)"
-                for b in batters
-            ]
-            add_doc(
-                f"{side.capitalize()} team batting order for {lineup_data.get('team', side)}: "
-                + "; ".join(batter_lines) + ".",
-                doc_type=f"{side}_lineup"
-            )
-
-    # 5. Batter profiles (weaknesses and strengths)
+    # 2. Batter weaknesses (Drop the raw numbers, keep the text analysis)
     for profile in game_data.get("batter_profiles", []):
-        if "error" in profile:
-            continue
-        overall = profile.get("overall", {})
+        if "error" in profile: continue
         weaknesses = profile.get("weakness_summary", [])
-        weakness_text = (
-            " Weaknesses: " + "; ".join(weaknesses) if weaknesses
-            else " No significant documented weaknesses."
-        )
-        add_doc(
-            f"Batter profile for {profile['batter']}: "
-            f"Chase rate {overall.get('chase_rate')}%, "
-            f"contact rate {overall.get('contact_rate')}%, "
-            f"hard hit {overall.get('hard_hit_pct')}%, "
-            f"avg exit velocity {overall.get('avg_exit_velocity')} mph."
-            + weakness_text,
-            doc_type="batter_profile",
-            player=profile["batter"]
-        )
+        if weaknesses:
+            add_doc(
+                f"Batter scouting for {profile['batter']}: " + "; ".join(weaknesses),
+                doc_type="batter_scouting", player=profile["batter"]
+            )
 
-    # 6. Injuries
+    # 3. Injuries
     injuries = game_data.get("injuries", [])
     if injuries:
-        inj_lines = [
-            f"{i['player']} ({i['team']}) — {i['type']} on {i['date']}: {i.get('description', '')}"
-            for i in injuries[:10]
-        ]
-        add_doc(
-            "Recent injury and IL transactions: " + " | ".join(inj_lines),
-            doc_type="injuries"
-        )
+        inj_lines = [f"{i['player']} ({i['team']}) — {i['type']}: {i.get('description', '')}" for i in injuries[:10]]
+        add_doc("Recent injuries: " + " | ".join(inj_lines), doc_type="injuries")
 
-    # 7. Umpire
+    # 4. Umpire
     ump = game_data.get("umpire", {})
     if ump:
-        add_doc(
-            ump.get("narrative", f"Umpire {ump.get('umpire', 'Unknown')} is assigned."),
-            doc_type="umpire",
-            umpire=ump.get("umpire", "")
-        )
+        add_doc(ump.get("narrative", f"Umpire {ump.get('umpire', 'Unknown')} is assigned."), doc_type="umpire")
 
-    # 8. Reddit / fan sentiment
+    # 5. Reddit / Fan sentiment
     for post in game_data.get("reddit_posts", [])[:5]:
-        add_doc(
-            f"Fan post ({post.get('subreddit', 'r/baseball')}): {post.get('title', '')} — "
-            f"{post.get('body', '')[:300]}",
-            doc_type="fan_sentiment",
-            source="reddit"
-        )
+        add_doc(f"Reddit Buzz ({post.get('subreddit', 'r/baseball')}): {post.get('title', '')} — {post.get('body', '')[:300]}", doc_type="reddit")
 
-    # 9. YouTube / creator takes
+    # 6. YouTube / Creator takes
     for yt in game_data.get("youtube_summaries", [])[:5]:
+        add_doc(f"YouTube Analysis ({yt.get('channel', 'Unknown')}): {yt.get('summary', '')[:400]}", doc_type="youtube")
+    
+    # 7. Written Analyst News
+    for article in game_data.get("analyst_news", []):
         add_doc(
-            f"Creator take from {yt.get('channel', 'Unknown')} — '{yt.get('title', '')}': "
-            f"{yt.get('summary', yt.get('description', ''))[:400]}",
-            doc_type="creator_take",
-            source="youtube",
-            channel=yt.get("channel", "")
+            f"Analyst Report ({article.get('team', 'Unknown')}): {article.get('title', '')} — {article.get('summary', '')}", 
+            doc_type="analyst_news"
         )
 
-    # Batch upsert into ChromaDB
+    # Clear old collection and batch upsert
+    try:
+        collection.delete(where={"game_id": game_id})
+    except Exception:
+        pass
+        
     if docs:
         collection.upsert(documents=docs, metadatas=metadatas, ids=ids)
 
     return len(docs)
 
 
-# ── RAG Query ─────────────────────────────────────────────────────────────────
+# ── LangChain Tools ───────────────────────────────────────────────────────────
 
-def query_pregame_brief(
-    matchup: str,
-    game_id: Optional[str] = None,
-    question: Optional[str] = None,
-    n_results: int = 12,
-) -> str:
+@tool
+def get_exact_matchup_stats(target: str) -> str:
     """
-    Main RAG query. Retrieves relevant context from ChromaDB and
-    asks the LLM to generate a pre-game briefing.
+    Use this tool to get EXACT mathematical stats (ERA, WHIP, K/9, Batting AVG, OPS, Arsenal).
+    Valid targets: 'home_pitcher', 'away_pitcher', 'home_pitcher_arsenal', 'away_pitcher_arsenal', 'home_lineup', 'away_lineup'.
+    """
+    data = CURRENT_GAME_STATS.get(target)
+    if not data:
+        return f"Exact stats for {target} are currently unavailable."
+    return str(data)
 
-    Args:
-        matchup: e.g. "Red Sox vs Brewers"
-        game_id: filter to specific game (optional)
-        question: custom question, or None for full pre-game brief
-        n_results: number of context chunks to retrieve
-
-    Returns: LLM-generated pre-game analysis as a string
+@tool
+def query_qualitative_data(query: str) -> str:
+    """
+    Use this tool to search for qualitative information: Fan sentiment, Reddit buzz, 
+    YouTube commentary, injury context, batter weaknesses, and umpire tendencies.
     """
     collection = get_collection()
-
-    # Build query — what we're searching for in the vector store
-    query_text = question or (
-        f"pre-game analysis starting pitcher lineup injuries umpire "
-        f"batter weaknesses matchup prediction for {matchup}"
-    )
-
-    # Retrieve relevant chunks
-    where_filter = {"game_id": game_id} if game_id else None
-    results = collection.query(
-        query_texts=[query_text],
-        n_results=min(n_results, collection.count() or 1),
-        where=where_filter,
-    )
-
-    # Format retrieved context
+    results = collection.query(query_texts=[query], n_results=6)
     chunks = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-
-    if not chunks:
-        return f"No data found for {matchup}. Please run the data ingestion first."
-
-    context_blocks = []
-    for i, (chunk, meta) in enumerate(zip(chunks, metadatas)):
-        doc_type = meta.get("type", "unknown")
-        context_blocks.append(f"[{doc_type.upper()}]\n{chunk}")
-
-    context = "\n\n".join(context_blocks)
-
-    # Build prompt
-    system_prompt = """You are Baseball IQ — an elite baseball analyst platform that 
-combines Statcast data, injury reports, umpire tendencies, fan sentiment, and 
-creator takes to generate sharp pre-game briefings.
-
-Your output should feel like a cross between a seasoned beat reporter and a 
-data analyst. Be specific with numbers. Flag real risks. Surface the hidden story.
-Structure your brief clearly with sections."""
-
-    user_prompt = f"""Using the following retrieved data, generate a comprehensive 
-pre-game briefing for: {matchup}
-
-RETRIEVED CONTEXT:
-{context}
-
-Generate a pre-game brief with these sections:
-1. **Matchup Overview** — Quick snapshot of the game
-2. **Starting Pitchers** — Arsenal, recent form, key stats, what to watch
-3. **Lineup Analysis** — Who's hot, who's cold, key matchup advantages
-4. **Injury Report** — Who's in/out and how it affects the game
-5. **Umpire Card** — Tonight's ump tendencies and what it means for both teams
-6. **The Hidden Story** — One underrated angle most fans will miss
-7. **Prediction** — Who wins and why, with confidence level
-
-Be specific. Use the numbers from the data. Don't be generic."""
-
-    return _call_llm(system_prompt, user_prompt)
+    return "\n\n".join(chunks) if chunks else "No narrative data found in vector DB."
 
 
+# ── Hybrid RAG Agent ──────────────────────────────────────────────────────────
+def query_pregame_brief(matchup: str, game_id: Optional[str] = None) -> str:
+    from langchain_ollama import ChatOllama
+    from langchain_core.messages import SystemMessage
+
+    llm = ChatOllama(
+        model="llama3.1",
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        temperature=0.1
+    )
+
+    tools = [get_exact_matchup_stats, query_qualitative_data]
+
+    system_prompt = """You are Baseball IQ — an elite baseball analyst. 
+    Write a sharp, accurate pre-game brief for the given matchup.
+    
+    CRITICAL RULES:
+    1. For any statistical data (ERA, lineups, velocity, averages), you MUST use the `get_exact_matchup_stats` tool. DO NOT make up numbers.
+    2. For narrative, fan sentiment, weaknesses, injuries, and umpire data, use the `query_qualitative_data` tool.
+    
+    Structure your brief clearly with Markdown headers:
+    - ⚾ Matchup Overview
+    - 🔥 Pitching Breakdown (Use exact stats & arsenal)
+    - 👥 Lineup Analysis (Who is hot/cold)
+    - 🏥 Injury Report
+    - 🧑‍⚖️ Umpire Card & Fan Pulse (Combine sentiment and umpire tendencies)
+    - 🔮 The Hidden Story & Prediction"""
+
+    agent_executor = create_react_agent(
+        llm,
+        tools,
+        prompt=SystemMessage(content=system_prompt)  # ✅ correct for langgraph 0.2+
+    )
+
+    try:
+        response = agent_executor.invoke({"messages": [("user", f"Generate the detailed pre-game brief for: {matchup}")]})
+        return response["messages"][-1].content
+    except Exception as e:
+        return f"⚠️ Agent execution error: {e}"
+    
 def query_custom(question: str, n_results: int = 8) -> str:
     """
-    Answer any baseball question using the RAG knowledge base.
-    E.g. "How does Rafael Devers hit against left-handed pitchers?"
+    Answer any generic baseball question using the qualitative RAG knowledge base.
     """
     collection = get_collection()
 
@@ -345,85 +243,21 @@ def query_custom(question: str, n_results: int = 8) -> str:
     chunks = results.get("documents", [[]])[0]
     if not chunks:
         return "No relevant data found. Try ingesting game data first."
-
+    
     context = "\n\n".join(chunks)
-
-    system_prompt = "You are Baseball IQ, a sharp baseball analyst. Answer concisely using only the provided data."
-    user_prompt = f"Context:\n{context}\n\nQuestion: {question}"
-
-    return _call_llm(system_prompt, user_prompt)
-
-
-# ── LLM Call ──────────────────────────────────────────────────────────────────
-
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
-
-
-def _call_ollama(system: str, user: str) -> str:
-    """Call a local Ollama model via its REST API."""
-    # Truncate user prompt to stay within a small context window
-    max_chars = 3000
-    if len(user) > max_chars:
-        user = user[:max_chars] + "\n...[truncated]"
-
-    resp = requests.post(
-        f"{OLLAMA_BASE_URL}/api/chat",
-        json={
-            "model": OLLAMA_MODEL,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "options": {
-                "num_ctx": 2048,   # smaller KV cache = ~64 MiB vs 128 MiB
-                "num_predict": 512, # limit response length
-            },
-        },
-        timeout=180,
+         
+    llm = ChatOllama(
+        model="llama3.1",
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        temperature=0.1
     )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
-
-
-def _call_llm(system: str, user: str) -> str:
-    """
-    Call the LLM with the following priority:
-      1. Ollama (local, free) — if reachable
-      2. Claude (Anthropic API) — if ANTHROPIC_API_KEY is set
-      3. Preview stub — prints prompts so you can inspect them
-    """
-    # 1. Try Ollama
-    if REQUESTS_AVAILABLE:
-        try:
-            return _call_ollama(system, user)
-        except Exception as e:
-            print(f"   ⚠️  Ollama unavailable ({e}). Trying Anthropic...")
-
-    # 2. Try Anthropic
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if ANTHROPIC_AVAILABLE and api_key:
-        try:
-            client = anthropic.Anthropic(api_key=api_key)
-            message = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=2000,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            return message.content[0].text
-        except Exception as e:
-            print(f"   ⚠️  Anthropic API error: {e}")
-
-    # 3. Fallback preview
-    return (
-        "⚠️  No LLM available. Install Ollama (https://ollama.com) and run:\n"
-        "   ollama pull llama3\n\n"
-        "SYSTEM PROMPT PREVIEW:\n" + system[:200] + "...\n\n"
-        "USER PROMPT PREVIEW (first 500 chars):\n" + user[:500] + "..."
-    )
-
+    
+    prompt = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer concisely using only the provided data."
+    
+    try:
+        return llm.invoke(prompt).content
+    except Exception as e:
+        return f"⚠️ LLM error: {e}"
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -435,7 +269,6 @@ def get_collection_stats() -> dict:
     if count == 0:
         return {"total_documents": 0, "message": "No data ingested yet."}
 
-    # Sample metadata to show what's in there
     sample = collection.get(limit=min(count, 50))
     types = {}
     matchups = set()
@@ -465,7 +298,7 @@ def clear_collection():
 # ── Demo: Ingest Mock Data + Query ────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("🧠 Baseball IQ — RAG Pipeline Demo")
+    print("🧠 Baseball IQ — Hybrid RAG Pipeline Demo")
     print("=" * 60)
 
     # Mock game data (replaces real scraped data for testing)
@@ -476,9 +309,6 @@ if __name__ == "__main__":
             "away_team": "Boston Red Sox",
             "home_team": "Milwaukee Brewers",
             "venue": "American Family Field",
-            "home_probable_pitcher": {"name": "Freddy Peralta", "id": 669302},
-            "away_probable_pitcher": {"name": "Brayan Bello", "id": 678594},
-            "status": "Scheduled",
         },
         "home_pitcher_stats": {
             "name": "Freddy Peralta",
@@ -519,27 +349,8 @@ if __name__ == "__main__":
         "batter_profiles": [
             {
                 "batter": "Rafael Devers",
-                "overall": {
-                    "chase_rate": 28.4,
-                    "contact_rate": 74.2,
-                    "hard_hit_pct": 52.1,
-                    "avg_exit_velocity": 93.8,
-                },
                 "weakness_summary": [
                     "Struggles vs SL — 34.2% whiff rate on 89 pitches seen",
-                    "Hits only .178 against sliders away",
-                ],
-            },
-            {
-                "batter": "Christian Yelich",
-                "overall": {
-                    "chase_rate": 24.1,
-                    "contact_rate": 77.8,
-                    "hard_hit_pct": 44.3,
-                    "avg_exit_velocity": 91.2,
-                },
-                "weakness_summary": [
-                    "Hits only .182 against sinkers down in zone",
                 ],
             },
         ],
@@ -554,26 +365,23 @@ if __name__ == "__main__":
         ],
         "umpire": {
             "umpire": "Dan Bellino",
-            "accuracy_pct": "93.1",
             "narrative": (
                 "Dan Bellino is above-average in accuracy at 93.1%. "
                 "He runs a tight zone on the outer half but is consistent. "
-                "Good framing catchers benefit in his games. "
-                "Pitchers with sharp horizontal movement get favorable calls."
             ),
         },
         "reddit_posts": [
             {
                 "subreddit": "r/redsox",
                 "title": "Bello needs to get out of the 2nd inning habit",
-                "body": "He's given up the most runs in the 2nd inning of any starter this year. Classic slow starter.",
+                "body": "He's given up the most runs in the 2nd inning of any starter this year.",
             },
         ],
         "youtube_summaries": [
             {
                 "channel": "Jomboy Media",
-                "title": "Brewers are sneaky good in April — here's why",
-                "summary": "Talkin' Baseball broke down how Milwaukee's bullpen has a 2.14 ERA in April over the last 3 seasons. They're a nightmare late-game opponent right now.",
+                "title": "Brewers are sneaky good in April",
+                "summary": "Milwaukee's bullpen has a 2.14 ERA in April. They're a nightmare late-game opponent.",
             },
         ],
     }
@@ -582,6 +390,7 @@ if __name__ == "__main__":
     print("\n📥 Ingesting mock game data...")
     n = ingest_game_data(mock_game_data)
     print(f"   Stored {n} documents in ChromaDB")
+    print(f"   Loaded Structured Stats into memory.")
 
     # Stats
     print("\n📊 Vector store contents:")
@@ -590,7 +399,7 @@ if __name__ == "__main__":
         print(f"   {k}: {v}")
 
     # Query
-    print("\n🔍 Generating pre-game brief...")
+    print("\n🔍 Generating AI Agent pre-game brief...")
     print("-" * 60)
     brief = query_pregame_brief("Boston Red Sox vs Milwaukee Brewers")
     print(brief)

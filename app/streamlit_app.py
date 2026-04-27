@@ -21,9 +21,10 @@ from plotly.subplots import make_subplots
 import sys
 import os
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date
 import numpy as np
-import time
+import asyncio
+import aiohttp
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
@@ -149,13 +150,33 @@ st.markdown("""
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 
-from scraper.mlb_api import get_games, get_pitcher_stats, get_lineup, get_injuries
+from scraper.mlb_api import get_bullpen_fatigue, get_games, get_pitcher_stats, get_lineup, get_injuries, get_team_id
 from scraper.reddit_youtube import get_reddit_posts, get_youtube_summaries
 from scraper.umpire import get_umpire_fallback
+from scraper.weather import get_weather_and_park
+from scraper.analyst_news import get_team_news
+
+# ── Helpers for Async Calls ───────────────────────────────────────────────────
+
+def run_async(coro):
+    """Helper to run async functions synchronously in Streamlit setup."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+def fetch_today_games():
+    """Synchronously cache the fetched games."""
+    async def _get_games_async():
+        async with aiohttp.ClientSession() as session:
+            return await get_games(session)
+    return run_async(_get_games_async())
 
 # ── Real game schedule ────────────────────────────────────────────────────────
 
-real_games = get_games()
+real_games = fetch_today_games()
 
 # Add a display label to each game
 for g in real_games:
@@ -166,8 +187,7 @@ if not real_games:
     st.error("No MLB games found for today. Try again later or check your connection.")
     st.stop()
 
-
-# ── Data-fetching helpers (cached) ────────────────────────────────────────────
+# ── Data-fetching helpers (cached & mixed async wrappers) ─────────────────────
 
 @st.cache_data(ttl=300)
 def fetch_pitcher(pitcher_id, pitcher_name: str) -> dict:
@@ -182,7 +202,11 @@ def fetch_pitcher(pitcher_id, pitcher_name: str) -> dict:
             "arsenal": [],
         }
 
-    stats = get_pitcher_stats(pitcher_id)
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            return await get_pitcher_stats(session, pitcher_id)
+            
+    stats = run_async(_fetch())
     era   = stats.get("era", "N/A")
     whip  = stats.get("whip", "N/A")
     k9    = stats.get("strikeout_per_9", "N/A")
@@ -207,21 +231,22 @@ def fetch_pitcher(pitcher_id, pitcher_name: str) -> dict:
         "ip": ip,
         "recent_form": "N/A",
         "scouting": scouting,
-        "arsenal": [],   # Statcast arsenal requires pybaseball (see scraper/statcast.py)
+        "arsenal": [],
     }
 
 
 @st.cache_data(ttl=300)
 def fetch_lineup(game_id: int) -> dict:
-    """Fetch confirmed batting lineups; returns empty dict if not yet posted."""
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            return await get_lineup(session, game_id)
     try:
-        return get_lineup(game_id)
+        return run_async(_fetch())
     except Exception:
         return {}
 
 
 def _adapt_lineup(batting_order: list) -> list:
-    """Convert MLB API batting_order list to the UI batter format."""
     adapted = []
     for b in batting_order:
         adapted.append({
@@ -230,24 +255,26 @@ def _adapt_lineup(batting_order: list) -> list:
             "avg":  b.get("batting_avg", ".???"),
             "hr":   b.get("home_runs", 0),
             "ops":  b.get("ops", ".???"),
-            "form": "✅ Normal",   # live form requires Statcast (scraper/statcast.py)
-            "weakness": "N/A",    # weaknesses require Statcast
+            "form": "✅ Normal",
+            "weakness": "N/A",
         })
     return adapted
 
 
 @st.cache_data(ttl=600)
 def fetch_injuries(home_team: str, away_team: str) -> list:
-    """Pull IL transactions for the past 7 days and filter to tonight's teams."""
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            return await get_injuries(session, days_back=7)
     try:
-        raw = get_injuries(days_back=7)
+        raw = run_async(_fetch())
     except Exception:
         return []
 
     team_words = {
         w.lower() for t in [home_team, away_team]
         for w in t.split()
-        if len(w) > 3  # skip short words like "the"
+        if len(w) > 3
     }
 
     injuries = []
@@ -266,11 +293,14 @@ def fetch_injuries(home_team: str, away_team: str) -> list:
 
 @st.cache_data(ttl=300)
 def fetch_fan_pulse(query: str):
-    """Reddit posts + YouTube summaries for a matchup query."""
-    reddit = get_reddit_posts(query, limit=6)
-    youtube = get_youtube_summaries(query, max_results=4)
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            reddit_task = get_reddit_posts(session, query, limit=6)
+            youtube_task = get_youtube_summaries(session, query, max_results=4)
+            return await asyncio.gather(reddit_task, youtube_task)
+            
+    reddit, youtube = run_async(_fetch())
 
-    # Normalize reddit field names (real API uses 'subreddit', mock uses 'sub')
     for p in reddit:
         if "subreddit" in p and "sub" not in p:
             p["sub"] = p["subreddit"]
@@ -279,7 +309,6 @@ def fetch_fan_pulse(query: str):
         p.setdefault("comments", 0)
         p.setdefault("body", "")
 
-    # Normalize youtube field names
     for v in youtube:
         v.setdefault("views", "N/A")
         v.setdefault("summary", v.get("description", ""))
@@ -287,13 +316,16 @@ def fetch_fan_pulse(query: str):
     return reddit, youtube
 
 
-@st.cache_data(ttl=600)
 def fetch_umpire(game_id: int) -> dict:
-    """Try to get the home plate umpire from the boxscore; fallback to generic."""
     ump_name = "TBD"
+    
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
+            async with session.get(url) as r:
+                return await r.json()
     try:
-        from scraper.mlb_api import _get
-        data = _get(f"/game/{game_id}/boxscore")
+        data = run_async(_fetch())
         for official in data.get("officials", []):
             if official.get("officialType", "") == "Home Plate":
                 ump_name = official.get("official", {}).get("fullName", "TBD")
@@ -305,8 +337,7 @@ def fetch_umpire(game_id: int) -> dict:
     accuracy = float(profile.get("accuracy_pct", 92.8) or 92.8)
     narrative = profile.get("narrative", (
         f"Umpire assignment for this game has not yet been announced. "
-        f"The 2025 MLB average ball/strike accuracy is 92.8% per Statcast. "
-        f"In 2026, each team gets 2 ABS challenges per game."
+        f"The MLB average ball/strike accuracy is 92.8% per Statcast. "
     ))
 
     return {
@@ -324,6 +355,34 @@ def fetch_umpire(game_id: int) -> dict:
         },
     }
 
+def fetch_advanced_context_sync(home_team: str, away_team: str):
+    """Synchronously cache weather, bullpen data, and analyst news."""
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            # 1. Setup tasks
+            weather_task = get_weather_and_park(session, home_team)
+            home_id_task = get_team_id(session, home_team)
+            away_id_task = get_team_id(session, away_team)
+            home_news_task = get_team_news(session, home_team)
+            away_news_task = get_team_news(session, away_team)
+            
+            # 2. Execute First Batch
+            park_weather, home_team_id, away_team_id, home_news, away_news = await asyncio.gather(
+                weather_task, home_id_task, away_id_task, home_news_task, away_news_task
+            )
+            
+            # 3. Execute Second Batch (Requires IDs)
+            async def safe_bullpen(tid):
+                return await get_bullpen_fatigue(session, tid) if tid else []
+                
+            home_bullpen, away_bullpen = await asyncio.gather(
+                safe_bullpen(home_team_id),
+                safe_bullpen(away_team_id)
+            )
+            
+            return park_weather, home_bullpen, away_bullpen, home_news, away_news
+            
+    return run_async(_fetch())
 
 # ── Session State ─────────────────────────────────────────────────────────────
 
@@ -335,32 +394,16 @@ if "use_ai" not in st.session_state:
     st.session_state.use_ai = False
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers for Charts ────────────────────────────────────────────────────────
 
 def form_badge(form: str) -> str:
     if "Hot" in form:   return f'<span class="badge-hot">{form}</span>'
     if "Cold" in form:  return f'<span class="badge-cold">{form}</span>'
     return f'<span class="badge-ok">{form}</span>'
 
-
-def pitch_type_color(pitch: str) -> str:
-    colors = {
-        "4-Seam FB": "#f56565", "Sinker": "#4299e1", "Slider": "#ed8936",
-        "Changeup": "#48bb78",  "Curve": "#9f7aea",  "Cutter": "#f6e05e",
-        "Forkball": "#fc8181",  "Knuckle-CB": "#b794f4",
-    }
-    return colors.get(pitch, "#a0aec0")
-
-
 def radar_chart(zone_profile: dict) -> go.Figure:
-    """Strike zone accuracy radar chart."""
     labels = ["Inside Strike", "Outside Strike", "High Strike", "Low Strike"]
-    values = [
-        zone_profile["inside_strike"],
-        zone_profile["outside_strike"],
-        zone_profile["high_strike"],
-        zone_profile["low_strike"],
-    ]
+    values = [zone_profile["inside_strike"], zone_profile["outside_strike"], zone_profile["high_strike"], zone_profile["low_strike"]]
     values_closed = values + [values[0]]
     labels_closed = labels + [labels[0]]
 
@@ -371,18 +414,15 @@ def radar_chart(zone_profile: dict) -> go.Figure:
         name="Accuracy %"
     ))
     avg = [93.0] * 4
-    avg_closed = avg + [avg[0]]
     fig.add_trace(go.Scatterpolar(
-        r=avg_closed, theta=labels_closed, fill="toself",
-        fillcolor="rgba(160,174,192,0.05)",
-        line=dict(color="#a0aec0", width=1, dash="dot"),
+        r=avg + [avg[0]], theta=labels_closed, fill="toself",
+        fillcolor="rgba(160,174,192,0.05)", line=dict(color="#a0aec0", width=1, dash="dot"),
         name="MLB Avg (93%)"
     ))
     fig.update_layout(
         polar=dict(
             radialaxis=dict(visible=True, range=[85, 97], tickfont=dict(color="#a0aec0")),
-            angularaxis=dict(tickfont=dict(color="#e2e8f0")),
-            bgcolor="#1a1f2e",
+            angularaxis=dict(tickfont=dict(color="#e2e8f0")), bgcolor="#1a1f2e",
         ),
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
         legend=dict(font=dict(color="#a0aec0")),
@@ -390,108 +430,51 @@ def radar_chart(zone_profile: dict) -> go.Figure:
     )
     return fig
 
-
 def arsenal_chart(arsenal: list, pitcher_name: str) -> go.Figure:
-    """Grouped bar chart: pitch usage, velocity, whiff rate."""
     pitches = [p["pitch"] for p in arsenal]
     colors  = [p.get("color", "#63b3ed") for p in arsenal]
-
-    fig = make_subplots(
-        rows=1, cols=3,
-        subplot_titles=["Usage %", "Avg Velocity (mph)", "Whiff Rate %"],
-    )
+    fig = make_subplots(rows=1, cols=3, subplot_titles=["Usage %", "Avg Velocity (mph)", "Whiff Rate %"])
 
     for i, (key, row) in enumerate([("pct", 1), ("velo", 2), ("whiff", 3)]):
         vals = [p[key] for p in arsenal]
         fig.add_trace(go.Bar(
-            x=pitches, y=vals,
-            marker_color=colors,
-            showlegend=False,
-            text=[f"{v:.1f}" for v in vals],
-            textposition="outside",
-            textfont=dict(color="#e2e8f0", size=11),
+            x=pitches, y=vals, marker_color=colors, showlegend=False,
+            text=[f"{v:.1f}" for v in vals], textposition="outside", textfont=dict(color="#e2e8f0", size=11),
         ), row=1, col=row)
 
-    fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-        font=dict(color="#a0aec0"),
-        height=300,
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
-    fig.update_xaxes(tickfont=dict(color="#e2e8f0"))
-    fig.update_yaxes(gridcolor="#2d3748", tickfont=dict(color="#a0aec0"))
+    fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=300, margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
 def plot_pitch_movement(df_pitches: pd.DataFrame) -> go.Figure:
-    """Scatter plot of horizontal vs. vertical pitch break (pfx_x vs pfx_z)."""
     fig = px.scatter(
         df_pitches, x="pfx_x", y="pfx_z", color="pitch_type",
-        color_discrete_map={
-            "FF": "#f56565", "SI": "#4299e1", "SL": "#ed8936",
-            "CH": "#48bb78", "CU": "#9f7aea", "FC": "#f6e05e", "ST": "#fc8181"
-        },
+        color_discrete_map={"FF": "#f56565", "SI": "#4299e1", "SL": "#ed8936", "CH": "#48bb78", "CU": "#9f7aea", "FC": "#f6e05e", "ST": "#fc8181"},
         labels={"pfx_x": "Horizontal Break (in)", "pfx_z": "Vertical Break (in)", "pitch_type": "Pitch"}
     )
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#4a5568")
     fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#4a5568")
-    fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-        font=dict(color="#a0aec0"),
-        height=350, margin=dict(l=20, r=20, t=30, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
+    fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=350, margin=dict(l=20, r=20, t=30, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     return fig
 
 def plot_strike_zone(df_pitches: pd.DataFrame) -> go.Figure:
-    """Heatmap of pitch locations over the plate (plate_x vs plate_z)."""
     fig = go.Figure()
-    
-    # 2D Density Contour
-    fig.add_trace(go.Histogram2dContour(
-        x=df_pitches["plate_x"], y=df_pitches["plate_z"],
-        colorscale="YlOrRd", reversescale=False, showscale=False,
-        ncontours=15, line=dict(width=0)
-    ))
-    
-    # Draw the Strike Zone
-    fig.add_shape(
-        type="rect", x0=-0.83, y0=1.5, x1=0.83, y1=3.5,
-        line=dict(color="white", width=2, dash="dash"),
-        fillcolor="rgba(0,0,0,0)"
-    )
-    
-    fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-        font=dict(color="#a0aec0"), height=350,
-        xaxis=dict(title="Plate X", range=[-2.5, 2.5], zeroline=False),
-        yaxis=dict(title="Plate Z", range=[0, 5], zeroline=False),
-        margin=dict(l=20, r=20, t=30, b=20)
-    )
+    fig.add_trace(go.Histogram2dContour(x=df_pitches["plate_x"], y=df_pitches["plate_z"], colorscale="YlOrRd", reversescale=False, showscale=False, ncontours=15, line=dict(width=0)))
+    fig.add_shape(type="rect", x0=-0.83, y0=1.5, x1=0.83, y1=3.5, line=dict(color="white", width=2, dash="dash"), fillcolor="rgba(0,0,0,0)")
+    fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=350, xaxis=dict(title="Plate X", range=[-2.5, 2.5], zeroline=False), yaxis=dict(title="Plate Z", range=[0, 5], zeroline=False), margin=dict(l=20, r=20, t=30, b=20))
     return fig
 
 def plot_spray_chart(df_hits: pd.DataFrame) -> go.Figure:
-    """Basic batter spray chart using hit coordinates (hc_x, hc_y)."""
     fig = px.scatter(
         df_hits, x="hc_x", y="hc_y", color="events",
         color_discrete_map={"Single": "#63b3ed", "Double": "#48bb78", "Triple": "#ed8936", "Home Run": "#f56565"},
         labels={"hc_x": "", "hc_y": "", "events": "Result"}
     )
-    # Mock baseball diamond overlay
     fig.add_shape(type="path", path="M 125 204 L 125 100 L 25 100 Z", line_color="#4a5568", fillcolor="rgba(0,0,0,0)")
-    
-    fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-        font=dict(color="#a0aec0"), height=300,
-        xaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False),
-        yaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False, autorange="reversed"),
-        margin=dict(l=0, r=0, t=20, b=0),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5)
-    )
+    fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=300, xaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False), yaxis=dict(range=[0, 250], showgrid=False, zeroline=False, visible=False, autorange="reversed"), margin=dict(l=0, r=0, t=20, b=0), legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5))
     return fig
 
-# --- TEMPORARY MOCK DATA GENERATOR ---
+# MOCK DATA
 def get_mock_statcast_pitcher(pitcher_name):
-    """Generates fake pitch-by-pitch coordinate data until pybaseball is hooked up."""
     n_pitches = 200
     pitch_types = np.random.choice(["FF", "SL", "CH", "CU"], n_pitches, p=[0.5, 0.3, 0.15, 0.05])
     return pd.DataFrame({
@@ -503,7 +486,6 @@ def get_mock_statcast_pitcher(pitcher_name):
     })
 
 def get_mock_spray_chart():
-    """Generates fake batted ball coordinates."""
     n_hits = 50
     events = np.random.choice(["Single", "Double", "Home Run"], n_hits, p=[0.6, 0.3, 0.1])
     return pd.DataFrame({
@@ -515,65 +497,36 @@ def get_mock_spray_chart():
 def try_real_rag(game: dict, home_p: dict, away_p: dict,
                  home_lineup: list, away_lineup: list,
                  injuries: list, umpire: dict,
-                 reddit_posts: list, youtube: list) -> str:
-    """Attempt to call real RAG pipeline."""
+                 reddit_posts: list, youtube: list,
+                 park_weather: dict, home_bullpen: list, away_bullpen: list,
+                 home_news: list, away_news: list) -> str: # <--- Added here
     try:
         from pipeline.rag import ingest_game_data, query_pregame_brief
         from dotenv import load_dotenv
         load_dotenv(ROOT / ".env")
 
+        game_with_weather = game.copy()
+        game_with_weather["weather_and_park_factors"] = park_weather.get("narrative", "Weather unknown.")
+
         game_data = {
-            "game": game,
-            "home_pitcher_stats": {
-                "name": home_p["name"], "era": home_p["era"],
-                "whip": home_p["whip"], "strikeouts": "N/A",
-                "innings_pitched": home_p["ip"], "wins": home_p["wins"],
-                "losses": home_p["losses"], "strikeout_per_9": home_p["k9"],
-            },
-            "away_pitcher_stats": {
-                "name": away_p["name"], "era": away_p["era"],
-                "whip": away_p["whip"], "strikeouts": "N/A",
-                "innings_pitched": away_p["ip"], "wins": away_p["wins"],
-                "losses": away_p["losses"], "strikeout_per_9": away_p["k9"],
-            },
-            "home_pitcher_arsenal": {
-                "pitcher": home_p["name"],
-                "arsenal": {p["pitch"]: {"usage_pct": p["pct"], "avg_velocity": p["velo"],
-                                         "whiff_rate": p["whiff"]}
-                            for p in home_p["arsenal"]},
-            },
-            "away_pitcher_arsenal": {
-                "pitcher": away_p["name"],
-                "arsenal": {p["pitch"]: {"usage_pct": p["pct"], "avg_velocity": p["velo"],
-                                         "whiff_rate": p["whiff"]}
-                            for p in away_p["arsenal"]},
-            },
-            "batter_profiles": [
-                {"batter": b["name"], "weakness_summary": [b["weakness"]]}
-                for b in away_lineup[:4]
+            "game": game_with_weather,
+            "home_pitcher_stats": {"name": home_p["name"], "era": home_p["era"], "whip": home_p["whip"], "strikeouts": "N/A", "innings_pitched": home_p["ip"], "wins": home_p["wins"], "losses": home_p["losses"], "strikeout_per_9": home_p["k9"]},
+            "away_pitcher_stats": {"name": away_p["name"], "era": away_p["era"], "whip": away_p["whip"], "strikeouts": "N/A", "innings_pitched": away_p["ip"], "wins": away_p["wins"], "losses": away_p["losses"], "strikeout_per_9": away_p["k9"]},
+            "home_pitcher_arsenal": {"pitcher": home_p["name"], "arsenal": {p["pitch"]: {"usage_pct": p["pct"], "avg_velocity": p["velo"], "whiff_rate": p["whiff"]} for p in home_p["arsenal"]}},
+            "away_pitcher_arsenal": {"pitcher": away_p["name"], "arsenal": {p["pitch"]: {"usage_pct": p["pct"], "avg_velocity": p["velo"], "whiff_rate": p["whiff"]} for p in away_p["arsenal"]}},
+            "bullpens": [
+                {"team": game["home_team"], "fatigued_relievers": [p for p in home_bullpen if p["fatigued"] == "Yes"]},
+                {"team": game["away_team"], "fatigued_relievers": [p for p in away_bullpen if p["fatigued"] == "Yes"]}
             ],
-            "injuries": [
-                {"player": i["player"], "team": i["team"],
-                 "type": i["status"], "date": game["date"],
-                 "description": i["issue"]}
-                for i in injuries
-            ],
-            "umpire": {
-                "umpire": umpire["name"],
-                "accuracy_pct": str(umpire["accuracy"]),
-                "narrative": umpire["narrative"],
-            },
-            "reddit_posts": [
-                {"subreddit": p["sub"], "title": p["title"], "body": p["body"]}
-                for p in reddit_posts
-            ],
-            "youtube_summaries": [
-                {"channel": y["channel"], "title": y["title"], "summary": y["summary"]}
-                for y in youtube
-            ],
+            "batter_profiles": [{"batter": b["name"], "weakness_summary": [b["weakness"]]} for b in away_lineup[:4]],
+            "injuries": [{"player": i["player"], "team": i["team"], "type": i["status"], "date": game["date"], "description": i["issue"]} for i in injuries],
+            "umpire": {"umpire": umpire["name"], "accuracy_pct": str(umpire["accuracy"]), "narrative": umpire["narrative"]},
+            "reddit_posts": [{"subreddit": p["sub"], "title": p["title"], "body": p["body"]} for p in reddit_posts],
+            "youtube_summaries": [{"channel": y["channel"], "title": y["title"], "summary": y["summary"]} for y in youtube],
+            "analyst_news": home_news + away_news,
         }
 
-        n = ingest_game_data(game_data)
+        ingest_game_data(game_data)
         matchup = f"{game['away_team']} vs {game['home_team']}"
         return query_pregame_brief(matchup, game_id=game["game_id"])
 
@@ -598,11 +551,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### ⚙️ AI Settings")
-    use_real_ai = st.toggle("Use Real RAG Pipeline", value=False,
-        help="Requires ANTHROPIC_API_KEY or GROQ_API_KEY in .env")
-
-    if use_real_ai:
-        st.info("🔑 Set your API key in `.env` file")
+    use_real_ai = st.toggle("Use Local Ollama RAG", value=True, help="Powered by local Llama 3.1")
 
     st.divider()
     st.markdown("### 📡 Data Sources")
@@ -610,6 +559,7 @@ with st.sidebar:
 - ✅ MLB Stats API
 - ✅ Statcast / pybaseball
 - ✅ UmpScorecards
+- ✅ OpenWeatherMap
 - ⚙️ Reddit (add key)
 - ⚙️ YouTube (add key)
     """)
@@ -634,11 +584,12 @@ umpire         = fetch_umpire(game["game_id"])
 query          = f"{game['away_team']} {game['home_team']}"
 reddit_posts, youtube = fetch_fan_pulse(query)
 
+# Fetch new contextual async data safely and from cache
+park_weather, home_bullpen, away_bullpen, home_news, away_news = fetch_advanced_context_sync(game["home_team"], game["away_team"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEADER
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════
 col_title, col_meta = st.columns([3, 1])
 with col_title:
     st.markdown(f"# {game['away_team']} @ {game['home_team']}")
@@ -668,6 +619,13 @@ with k6:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+# ── Weather Element ───────────────────────────────────────────────────────────
+st.markdown(
+    f"**🏟️ Stadium Conditions:** {park_weather.get('park_name', 'Unknown')} | "
+    f"{park_weather.get('temp', 'N/A')} | Wind: {park_weather.get('wind', 'N/A')} | "
+    f"Park Factor: {park_weather.get('park_factor', 'N/A')}"
+)
+st.markdown("<br>", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
@@ -706,6 +664,8 @@ with tab1:
                     game, home_p, away_p,
                     home_lineup, away_lineup,
                     injuries, umpire, reddit_posts, youtube,
+                    park_weather, home_bullpen, away_bullpen,
+                    home_news, away_news
                 )
             st.session_state["brief_text"] = brief_text
             st.session_state["brief_generated"] = True
@@ -725,7 +685,7 @@ with tab1:
         st.markdown("""
         <div class="brief-box" style="opacity:0.5; text-align:center; padding: 60px;">
             <h3>👆 Click "Generate AI Pre-Game Brief" to get your analysis</h3>
-            <p>Powered by RAG — pulls from MLB Stats API, injury reports, umpire data, Reddit & YouTube</p>
+            <p>Powered by RAG — pulls from MLB Stats API, Statcast, UmpScorecards, Weather, Reddit & YouTube</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -753,14 +713,12 @@ with tab2:
 
             st.markdown('<p class="section-header">Arsenal & Movement</p>', unsafe_allow_html=True)
             
-            # Use real arsenal if available, otherwise fallback
             if pitcher["arsenal"]:
                 st.plotly_chart(
                     arsenal_chart(pitcher["arsenal"], pitcher["name"]),
                     use_container_width=True, key=f"arsenal_{side}"
                 )
             
-            # Advanced Statcast Visuals
             df_statcast = get_mock_statcast_pitcher(pitcher["name"])
             
             plot_col1, plot_col2 = st.columns(2)
@@ -787,7 +745,6 @@ with tab2:
             else:
                 st.info("Lineup not yet posted (typically released ~1 hr before first pitch).")
 
-    # Head-to-head highlights
     st.divider()
     st.markdown("### 🔁 Pitcher Highlights")
     hth_cols = st.columns(2)
@@ -820,10 +777,7 @@ with tab3:
             st.caption(f"Facing: {opp_pitcher['name']} ({opp_pitcher['era']} ERA)")
 
             if not lineup:
-                st.info(
-                    "📋 Lineup not yet posted. "
-                    "Check back closer to first pitch (~1 hour before game time)."
-                )
+                st.info("📋 Lineup not yet posted. Check back closer to first pitch (~1 hour before game time).")
                 continue
 
             hot  = sum(1 for b in lineup if "Hot" in b["form"])
@@ -841,50 +795,31 @@ with tab3:
                 with st.container():
                     bcol1, bcol2, bcol3, bcol4 = st.columns([3, 1.5, 1.5, 3])
                     with bcol1:
-                        st.markdown(
-                            f"**{i}. {b['name']}** <span style='color:#a0aec0;font-size:12px'>{b['pos']}</span>",
-                            unsafe_allow_html=True
-                        )
+                        st.markdown(f"**{i}. {b['name']}** <span style='color:#a0aec0;font-size:12px'>{b['pos']}</span>", unsafe_allow_html=True)
                     with bcol2:
                         st.markdown(f"`{b['avg']}` avg")
                     with bcol3:
                         st.markdown(f"`{b['hr']}` HR")
                     with bcol4:
-                        st.markdown(
-                            badge + f" &nbsp; <span style='color:#718096;font-size:12px'>⚠️ {b['weakness']}</span>",
-                            unsafe_allow_html=True
-                        )
+                        st.markdown(badge + f" &nbsp; <span style='color:#718096;font-size:12px'>⚠️ {b['weakness']}</span>", unsafe_allow_html=True)
                 if i < len(lineup):
                     st.markdown('<hr style="margin:4px 0;border-color:#2d3748">', unsafe_allow_html=True)
 
-            # Batter Spray Chart (Team Level)
             st.markdown('<p class="section-header">Team Spray Chart (Recent 14 Days)</p>', unsafe_allow_html=True)
             df_spray = get_mock_spray_chart()
             st.plotly_chart(plot_spray_chart(df_spray), use_container_width=True, key=f"spray_{team_name}")
 
-            # OPS chart
             st.markdown('<p class="section-header">OPS by Batting Position</p>', unsafe_allow_html=True)
             try:
                 ops_vals = [float(b["ops"]) for b in lineup]
-                ops_colors = [
-                    "#f56565" if "Hot" in b["form"] else
-                    "#63b3ed" if "Cold" in b["form"] else "#48bb78"
-                    for b in lineup
-                ]
+                ops_colors = ["#f56565" if "Hot" in b["form"] else "#63b3ed" if "Cold" in b["form"] else "#48bb78" for b in lineup]
                 fig_ops = go.Figure(go.Bar(
                     x=[f"{i+1}. {b['name'].split()[0]}" for i, b in enumerate(lineup)],
-                    y=ops_vals,
-                    marker_color=ops_colors,
-                    text=[b["ops"] for b in lineup],
-                    textposition="outside",
-                    textfont=dict(color="#e2e8f0", size=10),
+                    y=ops_vals, marker_color=ops_colors, text=[b["ops"] for b in lineup], textposition="outside", textfont=dict(color="#e2e8f0", size=10),
                 ))
                 fig_ops.update_layout(
-                    paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-                    font=dict(color="#a0aec0"), height=220,
-                    margin=dict(l=10, r=10, t=10, b=40),
-                    yaxis=dict(range=[0.5, 1.1], gridcolor="#2d3748"),
-                    xaxis=dict(tickfont=dict(size=9)),
+                    paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=220,
+                    margin=dict(l=10, r=10, t=10, b=40), yaxis=dict(range=[0.5, 1.1], gridcolor="#2d3748"), xaxis=dict(tickfont=dict(size=9)),
                 )
                 st.plotly_chart(fig_ops, use_container_width=True, key=f"ops_{team_name}")
             except (ValueError, TypeError):
@@ -899,11 +834,9 @@ with tab4:
 
     with ucol1:
         u1, u2, u3, u4 = st.columns(4)
-        u1.metric("Accuracy", f"{umpire['accuracy']}%",
-                  "Above avg" if umpire['accuracy'] >= 92.8 else "⚠️ Below avg")
+        u1.metric("Accuracy", f"{umpire['accuracy']}%", "Above avg" if umpire['accuracy'] >= 92.8 else "⚠️ Below avg")
         u2.metric("Calls/Game", umpire["calls_per_game"])
-        u3.metric("Missed/Game", umpire["missed_per_game"],
-                  f"-{round(148 - umpire['calls_per_game'] * (umpire['accuracy']/100), 1)} vs avg")
+        u3.metric("Missed/Game", umpire["missed_per_game"], f"-{round(148 - umpire['calls_per_game'] * (umpire['accuracy']/100), 1)} vs avg")
         favor_label = f"{'Home' if umpire['favor'] > 0 else 'Away'} lean"
         u4.metric("Favor Score", umpire["favor"], favor_label)
 
@@ -928,26 +861,16 @@ with tab4:
         st.plotly_chart(radar_chart(umpire["zone_profile"]), use_container_width=True, key="umpire_radar")
 
         st.markdown('<p class="section-header">Zone Breakdown</p>', unsafe_allow_html=True)
-        zone_df = pd.DataFrame([
-            {"Zone": k.replace("_", " ").title(), "Accuracy %": v}
-            for k, v in umpire["zone_profile"].items()
-        ])
+        zone_df = pd.DataFrame([{"Zone": k.replace("_", " ").title(), "Accuracy %": v} for k, v in umpire["zone_profile"].items()])
         fig_zone = px.bar(
-            zone_df, x="Zone", y="Accuracy %",
-            color="Accuracy %",
-            color_continuous_scale=["#f56565", "#ed8936", "#48bb78"],
-            range_color=[88, 96],
-            text="Accuracy %",
+            zone_df, x="Zone", y="Accuracy %", color="Accuracy %",
+            color_continuous_scale=["#f56565", "#ed8936", "#48bb78"], range_color=[88, 96], text="Accuracy %",
         )
-        fig_zone.add_hline(y=92.8, line_dash="dot", line_color="#a0aec0",
-                           annotation_text="MLB Avg", annotation_font_color="#a0aec0")
+        fig_zone.add_hline(y=92.8, line_dash="dot", line_color="#a0aec0", annotation_text="MLB Avg", annotation_font_color="#a0aec0")
         fig_zone.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
         fig_zone.update_layout(
-            paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-            font=dict(color="#a0aec0"), height=260,
-            margin=dict(l=10, r=10, t=10, b=10),
-            coloraxis_showscale=False,
-            yaxis=dict(range=[85, 97], gridcolor="#2d3748"),
+            paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=260,
+            margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False, yaxis=dict(range=[85, 97], gridcolor="#2d3748"),
         )
         st.plotly_chart(fig_zone, use_container_width=True, key="zone_bar")
 
@@ -970,7 +893,7 @@ with tab4:
         """)
 
 
-# ── TAB 5: Fan Pulse ─────────────────────────────────────────────────────────
+# ── TAB 5: Fan Pulse & Bullpen ───────────────────────────────────────────────
 with tab5:
     fp1, fp2 = st.columns([1, 1])
 
@@ -1017,46 +940,38 @@ with tab5:
                 <div class="summary">{yt['summary']}</div>
             </div>
             """, unsafe_allow_html=True)
-
+            
         st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("### 🥵 Bullpen Fatigue (Last 3 Days)")
+        st.caption("Relievers over 35 pitches or 3 consecutive days.")
+        
+        fatigued_home = [p for p in home_bullpen if p["fatigued"] == "Yes"]
+        fatigued_away = [p for p in away_bullpen if p["fatigued"] == "Yes"]
+        
+        if fatigued_home or fatigued_away:
+            for p in fatigued_away:
+                st.warning(f"**{game['away_team']} - {p['name']}**: {p['pitches_last_3_days']} pitches across {p['recent_games']} games.")
+            for p in fatigued_home:
+                st.warning(f"**{game['home_team']} - {p['name']}**: {p['pitches_last_3_days']} pitches across {p['recent_games']} games.")
+        else:
+            st.success("No major bullpen fatigue detected for either team.")
 
-        # Sentiment gauge from Reddit
         if reddit_posts:
+            st.markdown("<br>", unsafe_allow_html=True)
             st.markdown("### 📊 Fan Sentiment")
             home_word = game["home_team"].split()[-1].lower()
             away_word = game["away_team"].split()[-1].lower()
-            home_mentions = sum(
-                1 for p in reddit_posts
-                if home_word in p["title"].lower() or home_word in p["body"].lower()
-            )
+            home_mentions = sum(1 for p in reddit_posts if home_word in p["title"].lower() or home_word in p["body"].lower())
             away_mentions = len(reddit_posts) - home_mentions
 
             fig_sent = go.Figure(go.Bar(
                 x=[game["away_team"].split()[-1], game["home_team"].split()[-1]],
-                y=[away_mentions, home_mentions],
-                marker_color=["#63b3ed", "#f56565"],
-                text=[f"{away_mentions} posts", f"{home_mentions} posts"],
-                textposition="outside",
+                y=[away_mentions, home_mentions], marker_color=["#63b3ed", "#f56565"],
+                text=[f"{away_mentions} posts", f"{home_mentions} posts"], textposition="outside",
             ))
             fig_sent.update_layout(
-                paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
-                font=dict(color="#a0aec0"), height=200,
-                margin=dict(l=10, r=10, t=10, b=10),
-                yaxis=dict(gridcolor="#2d3748"),
+                paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e", font=dict(color="#a0aec0"), height=200,
+                margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(gridcolor="#2d3748"),
                 title=dict(text="Reddit Post Mentions", font=dict(color="#a0aec0", size=12)),
             )
             st.plotly_chart(fig_sent, use_container_width=True, key="sentiment")
-
-        st.markdown('<p class="section-header">Connect Live Data</p>', unsafe_allow_html=True)
-        st.markdown("""
-        To pull real Reddit & YouTube data:
-        ```bash
-        # Reddit — free at reddit.com/prefs/apps
-        REDDIT_CLIENT_ID=your_id
-        REDDIT_CLIENT_SECRET=your_secret
-
-        # YouTube — free at console.cloud.google.com
-        YOUTUBE_API_KEY=your_key
-        ```
-        Add these to your `.env` file and the scrapers activate automatically.
-        """)
