@@ -1,20 +1,26 @@
+# Data & Baseball
 pybaseball
+pandas
+python-dotenv
+
+# Web Scraping
 requests
 beautifulsoup4
-playwright
-praw
+aiohttp
+
+# LLM & RAG
 langchain
 langchain-community
-langchain-anthropic
 langchain-ollama
 langchain-core
 langgraph
 chromadb
 sentence-transformers
-streamlit
-pandas
-xgboost
-scikit-learn
-python-dotenv
+
+# Frontend
 streamlit
 plotly
+
+# ML (only keep if actually used)
+xgboost
+scikit-learn
